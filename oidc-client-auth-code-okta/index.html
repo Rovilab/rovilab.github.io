@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OIDC / Okta via Apigee Tester</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color-scheme: light dark; }
+    body { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    h1, h2 { margin-bottom: 8px; }
+    section { border: 1px solid #8886; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+    label { display: block; font-size: 0.9rem; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 9px; margin-top: 5px; border: 1px solid #8888; border-radius: 7px; }
+    button { padding: 10px 14px; margin: 4px 6px 4px 0; cursor: pointer; border-radius: 8px; border: 1px solid #8888; }
+    pre { overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: #8881; padding: 12px; border-radius: 8px; min-height: 48px; }
+    .status { padding: 10px; border-radius: 8px; background: #8881; }
+    .error { background: #d332321f; }
+    .success { background: #2c9b4b1f; }
+    small { opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <h1>OIDC / Okta via Apigee Tester</h1>
+  <p>Tests Authorization Code, token exchange, claims, UserInfo, refresh, and revoke.</p>
+
+  <section>
+    <h2>Configuration</h2>
+    <div class="grid">
+      <label>Apigee base URL
+        <input id="baseUrl" placeholder="https://api.example.com/oidc-okta/v1/oauth" />
+      </label>
+      <label>Client ID
+        <input id="clientId" autocomplete="off" />
+      </label>
+      <label>Client Secret
+        <input id="clientSecret" type="password" autocomplete="off" />
+      </label>
+      <label>Scopes
+        <input id="scopes" value="openid profile email offline_access" />
+      </label>
+      <label>Authorization endpoint through Apigee
+        <input id="authorizeEndpoint" placeholder="https://api.example.com/oidc-okta/v1/oauth/authorize" />
+      </label>
+      <label>Token endpoint through Apigee
+        <input id="tokenEndpoint" placeholder="https://api.example.com/oidc-okta/v1/oauth/token" />
+      </label>
+      <label>UserInfo endpoint through Apigee
+        <input id="userinfoEndpoint" placeholder="https://api.example.com/oidc-okta/v1/oauth/userinfo" />
+      </label>
+      <label>Revoke endpoint through Apigee
+        <input id="revokeEndpoint" placeholder="https://api.example.com/oidc-okta/v1/oauth/revoke" />
+      </label>
+      <label>Redirect URI
+        <input id="redirectUri" />
+      </label>
+    </div>
+    <p><small>This page stores configuration in browser localStorage. A client secret in browser code is only acceptable for local testing.</small></p>
+    <button id="saveConfig">Save configuration</button>
+    <button id="clearConfig">Clear configuration</button>
+  </section>
+
+  <section>
+    <h2>Actions</h2>
+    <button id="signIn">1. Sign in</button>
+    <button id="userinfo">2. Call UserInfo</button>
+    <button id="refresh">3. Refresh tokens</button>
+    <button id="revoke">4. Revoke access token</button>
+    <button id="clearTokens">Clear local tokens</button>
+    <div id="status" class="status">Ready.</div>
+  </section>
+
+  <section>
+    <h2>Token response</h2>
+    <pre id="tokenResponse">No tokens.</pre>
+  </section>
+
+  <section>
+    <h2>ID token claims</h2>
+    <pre id="idTokenClaims">No ID token.</pre>
+  </section>
+
+  <section>
+    <h2>Access token claims</h2>
+    <pre id="accessTokenClaims">No access token or the token is opaque.</pre>
+  </section>
+
+  <section>
+    <h2>UserInfo response</h2>
+    <pre id="userinfoResponse">Not called.</pre>
+  </section>
+
+<script>
+(() => {
+  "use strict";
+
+  const fields = [
+    "baseUrl", "clientId", "clientSecret", "scopes", "authorizeEndpoint", "tokenEndpoint",
+    "userinfoEndpoint", "revokeEndpoint", "redirectUri"
+  ];
+  const $ = id => document.getElementById(id);
+
+  function defaultRedirectUri() {
+    return `${location.origin}${location.pathname}`;
+  }
+
+  function randomString(byteLength = 24) {
+    const bytes = new Uint8Array(byteLength);
+    crypto.getRandomValues(bytes);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function basicAuthHeader(config) {
+    return `Basic ${btoa(`${config.clientId}:${config.clientSecret}`)}`;
+  }
+
+  function normalizeBaseUrl(value) {
+    return value.trim().replace(/\/+$/, "");
+  }
+
+  function endpointFor(baseUrl, suffix) {
+    if (!baseUrl) return "";
+    return `${normalizeBaseUrl(baseUrl)}/${suffix}`;
+  }
+
+  function populateEndpoints(overwrite = false) {
+    const baseUrl = $("baseUrl").value;
+    const endpoints = {
+      authorizeEndpoint: endpointFor(baseUrl, "authorize"),
+      tokenEndpoint: endpointFor(baseUrl, "token"),
+      userinfoEndpoint: endpointFor(baseUrl, "userinfo"),
+      revokeEndpoint: endpointFor(baseUrl, "revoke")
+    };
+
+    for (const [field, value] of Object.entries(endpoints)) {
+      if (overwrite || !$(field).value.trim()) $(field).value = value;
+    }
+  }
+
+  function setStatus(message, type = "") {
+    $("status").textContent = message;
+    $("status").className = `status ${type}`;
+  }
+
+  function pretty(value) {
+    return JSON.stringify(value, null, 2);
+  }
+
+  function saveConfig() {
+    const config = {};
+    for (const field of fields) config[field] = $(field).value.trim();
+    localStorage.setItem("oidcTesterNoPkceConfig", JSON.stringify(config));
+    setStatus("Configuration saved.", "success");
+  }
+
+  function loadConfig() {
+    const saved = JSON.parse(localStorage.getItem("oidcTesterNoPkceConfig") || "{}");
+    for (const field of fields) {
+      if (saved[field]) $(field).value = saved[field];
+    }
+    populateEndpoints(false);
+    if (!$("redirectUri").value) $("redirectUri").value = defaultRedirectUri();
+  }
+
+  function getConfig() {
+    const config = {};
+    for (const field of fields) config[field] = $(field).value.trim();
+    for (const required of ["clientId", "clientSecret", "authorizeEndpoint", "tokenEndpoint", "userinfoEndpoint", "redirectUri"]) {
+      if (!config[required]) throw new Error(`Missing configuration: ${required}`);
+    }
+    return config;
+  }
+
+  function decodeJwt(token) {
+    const parts = token.split(".");
+    if (parts.length !== 3) throw new Error("Token is not a JWT.");
+    const normalized = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const bytes = Uint8Array.from(atob(padded), c => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  }
+
+  function readTokens() {
+    return JSON.parse(sessionStorage.getItem("oidcTokens") || "null");
+  }
+
+  function storeTokens(tokens) {
+    const previous = readTokens() || {};
+    const merged = { ...previous, ...tokens };
+    sessionStorage.setItem("oidcTokens", JSON.stringify(merged));
+    renderTokens();
+    return merged;
+  }
+
+  function clearTokens() {
+    sessionStorage.removeItem("oidcTokens");
+    sessionStorage.removeItem("oauthState");
+    sessionStorage.removeItem("oauthNonce");
+    renderTokens();
+    $("userinfoResponse").textContent = "Not called.";
+    setStatus("Local tokens cleared.", "success");
+  }
+
+  function renderTokens() {
+    const tokens = readTokens();
+    $("tokenResponse").textContent = tokens ? pretty(tokens) : "No tokens.";
+
+    try {
+      $("idTokenClaims").textContent = tokens?.id_token ? pretty(decodeJwt(tokens.id_token)) : "No ID token.";
+    } catch (error) {
+      $("idTokenClaims").textContent = `Cannot decode ID token: ${error.message}`;
+    }
+
+    try {
+      $("accessTokenClaims").textContent = tokens?.access_token ? pretty(decodeJwt(tokens.access_token)) : "No access token or the token is opaque.";
+    } catch {
+      $("accessTokenClaims").textContent = "The access token is opaque or is not a JWT.";
+    }
+  }
+
+  async function readResponse(response) {
+    const text = await response.text();
+    if (!text) return {};
+    try { return JSON.parse(text); }
+    catch { return { raw: text }; }
+  }
+
+  async function signIn() {
+    saveConfig();
+    const config = getConfig();
+    const state = randomString();
+    const nonce = randomString();
+
+    sessionStorage.setItem("oauthState", state);
+    sessionStorage.setItem("oauthNonce", nonce);
+
+    const url = new URL(config.authorizeEndpoint);
+    url.search = new URLSearchParams({
+      client_id: config.clientId,
+      response_type: "code",
+      response_mode: "query",
+      scope: config.scopes || "openid profile email",
+      redirect_uri: config.redirectUri,
+      state,
+      nonce
+    });
+
+    location.assign(url.toString());
+  }
+
+  async function exchangeCode(code, returnedState) {
+    const config = getConfig();
+    const expectedState = sessionStorage.getItem("oauthState");
+
+    if (!expectedState || returnedState !== expectedState) {
+      throw new Error("OAuth state validation failed.");
+    }
+
+    const response = await fetch(config.tokenEndpoint, {
+      method: "POST",
+      headers: {
+        "Authorization": basicAuthHeader(config),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json"
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        redirect_uri: config.redirectUri,
+        code
+      })
+    });
+
+    const body = await readResponse(response);
+    if (!response.ok) throw new Error(`Token request failed (${response.status}): ${pretty(body)}`);
+
+    const claims = body.id_token ? decodeJwt(body.id_token) : null;
+    const expectedNonce = sessionStorage.getItem("oauthNonce");
+    if (claims && expectedNonce && claims.nonce !== expectedNonce) {
+      throw new Error("ID token nonce validation failed.");
+    }
+
+    storeTokens(body);
+    sessionStorage.removeItem("oauthState");
+    sessionStorage.removeItem("oauthNonce");
+    history.replaceState({}, document.title, config.redirectUri);
+    setStatus("Sign-in and token exchange succeeded.", "success");
+  }
+
+  async function callUserInfo() {
+    const config = getConfig();
+    const tokens = readTokens();
+    if (!tokens?.access_token) throw new Error("No access token. Sign in first.");
+
+    const response = await fetch(config.userinfoEndpoint, {
+      headers: {
+        "Authorization": `Bearer ${tokens.access_token}`,
+        "Accept": "application/json"
+      }
+    });
+
+    const body = await readResponse(response);
+    $("userinfoResponse").textContent = pretty(body);
+    if (!response.ok) throw new Error(`UserInfo request failed (${response.status}): ${pretty(body)}`);
+    setStatus("UserInfo request succeeded.", "success");
+  }
+
+  async function refreshTokens() {
+    const config = getConfig();
+    const tokens = readTokens();
+    if (!tokens?.refresh_token) throw new Error("No refresh token. Include offline_access and allow refresh tokens.");
+
+    const response = await fetch(config.tokenEndpoint, {
+      method: "POST",
+      headers: {
+        "Authorization": basicAuthHeader(config),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json"
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: tokens.refresh_token
+      })
+    });
+
+    const body = await readResponse(response);
+    if (!response.ok) throw new Error(`Refresh failed (${response.status}): ${pretty(body)}`);
+    storeTokens(body);
+    setStatus("Tokens refreshed.", "success");
+  }
+
+  async function revokeAccessToken() {
+    const config = getConfig();
+    const tokens = readTokens();
+    if (!config.revokeEndpoint) throw new Error("Revoke endpoint is not configured.");
+    if (!tokens?.access_token) throw new Error("No access token. Sign in first.");
+
+    const response = await fetch(config.revokeEndpoint, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${tokens.access_token}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json"
+      },
+      body: new URLSearchParams({
+        token: tokens.access_token,
+        token_type_hint: "access_token"
+      })
+    });
+
+    const body = await readResponse(response);
+    if (!response.ok) throw new Error(`Revoke failed (${response.status}): ${pretty(body)}`);
+    clearTokens();
+    setStatus("Access token revoked.", "success");
+  }
+
+  async function run(action) {
+    try {
+      setStatus("Working...");
+      await action();
+    } catch (error) {
+      console.error(error);
+      setStatus(error.message || String(error), "error");
+    }
+  }
+
+  $("saveConfig").addEventListener("click", saveConfig);
+  $("baseUrl").addEventListener("change", () => populateEndpoints(true));
+  $("baseUrl").addEventListener("blur", () => populateEndpoints(false));
+  $("clearConfig").addEventListener("click", () => {
+    localStorage.removeItem("oidcTesterNoPkceConfig");
+    for (const field of fields) $(field).value = "";
+    $("scopes").value = "openid profile email offline_access";
+    $("redirectUri").value = defaultRedirectUri();
+    setStatus("Configuration cleared.", "success");
+  });
+  $("signIn").addEventListener("click", () => run(signIn));
+  $("userinfo").addEventListener("click", () => run(callUserInfo));
+  $("refresh").addEventListener("click", () => run(refreshTokens));
+  $("revoke").addEventListener("click", () => run(revokeAccessToken));
+  $("clearTokens").addEventListener("click", clearTokens);
+
+  loadConfig();
+  renderTokens();
+
+  const params = new URLSearchParams(location.search);
+  const oauthError = params.get("error");
+  const code = params.get("code");
+  const state = params.get("state");
+
+  if (oauthError) {
+    setStatus(`${oauthError}: ${params.get("error_description") || "Authorization failed."}`, "error");
+  } else if (code) {
+    run(() => exchangeCode(code, state));
+  }
+})();
+</script>
+</body>
+</html>
